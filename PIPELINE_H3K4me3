@@ -1,0 +1,489 @@
+# nathan dot lazar at gmail dot com
+
+# Directory /u0/dbase/nl/MOUSE_ALC/ contains scripts and input files
+# On exacloud: /home/exacloud/lustre1/users/lazar/MOUSE_ALC
+#              /home/exacloud/lustre1/users/lazar/bin has most scripts
+# Add these to the path
+PATH=$PATH/:/home/exacloud/lustre1/users/lazar/bin
+PATH=$PATH/:/home/exacloud/lustre1/users/lazar/bin/bedtools2/bin
+PATH=$PATH/:/opt/installed
+PATH=$PATH/:/home/exacloud/lustre1/users/lazar/bin/FastQC
+PATH=$PATH/:/home/exacloud/lustre1/users/lazar/bin/fastx
+export PATH
+
+# Software versions:
+# fastqc: v0.10.1
+# Trimmomatic v0.35  # Note needs to be in specific directory see step 2)
+# fastx: v0.0.13
+# BWA-mem: 0.7.9a
+# samtools: 0.1.19-44428cd
+# phantompeakqualtools 2.0
+# R:
+#   DiffBind v3.2
+
+##############################################################################################################
+# 1) Run fastqc on raw reads
+
+mkdir FASTQC
+fastqc --outdir FASTQC --noextract --threads 24 RAW_READS/*K4*.fastq.gz
+
+# Note: these files are soft links to the raw data stored in:
+# home/groups/hoolock/u0/Illumina_data/Mouse_ChIP_2016/DNA151222MG/160112_NS500681_0025_AHTGTHBGXX/DNA151222MG/
+
+# Look at the number of reads filtered, read length, etc. before trimming
+cd FASTQC
+for f in `ls *.zip`; do unzip $f; done
+grep "Total Sequences" */fastqc_data.txt
+grep "Sequence length" */fastqc_data.txt
+grep "Total Deduplicated Percentage" */fastqc_data.txt
+grep "^%GC" */fastqc_data.txt
+rm -r `ls --ignore=*.zip`
+cd ..
+
+# Reads are 75 bp long and look very good. Maybe trim 5 bp from the 5' and 3' end
+
+##############################################################################################################
+# 2) Trim w/ Trimmomatic
+
+for f in `ls RAW_READS/*K4*.fastq.gz`
+  do name=${f/.fastq.gz/}; name=$(basename $name)
+  java -jar ../bin/Trimmomatic-0.35/trimmomatic-0.35.jar SE -threads 24 -phred33 \
+    $f TRIMMED/$name.trim.fq.gz ILLUMINACLIP:../bin/Trimmomatic-0.35/adapters/TruSeq3-SE.fa:2:30:10 \
+    LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36 &> TRIMMED/$name.out
+done
+
+##############################################################################################################
+# 3) Run fastqc on processed reads to check trimming
+
+mkdir FASTQC_TRIM
+fastqc --outdir FASTQC_TRIM --noextract --threads 24 TRIMMED/*K4*trim.fq.gz
+
+# Look at the number of reads filtered, read length, etc. after trimming
+cd FASTQC_TRIM
+for f in `ls *.zip`; do unzip $f; done
+grep "Total Sequences" */fastqc_data.txt
+grep "Sequence length" */fastqc_data.txt
+grep "Total Deduplicated Percentage" */fastqc_data.txt
+grep "^%GC" */fastqc_data.txt
+rm -r `ls --ignore=*.zip`
+cd ..
+
+##############################################################################################################
+# 4) Remove exact copy reads using fastx_collapser
+
+for f in `ls TRIMMED/*K4*.trim.fq.gz`
+  do name=${f/_R1_001.trim.fq.gz/}; name=$(basename $name); echo $name
+  gunzip -c $f | fastx_collapser -Q33 > COLLAPSED/$name.trim.collapse.fa
+  gzip COLLAPSED/$name.trim.collapse.fa
+done
+
+# Count unique reads
+for f in `ls COLLAPSED/*K4*.fa.gz`
+  do echo $(basename $f)
+  echo $(expr $(zcat $f | wc -l) / 2)
+done
+
+##############################################################################################################
+# 5) Map with BWA-MEM (map_bwa_mem_se.sh)
+
+# Note: The genome must first be indexed w/ bwa index
+# Arguments to script are: genome.fasta read_file output_name
+
+for r1 in `ls COLLAPSED/*K4*.trim.collapse.fa.gz`
+  do base=${r1/.fa.gz/}; base=$(basename $base)
+  echo $r1 $base
+  ./run_bwa_mem_se.sh MOUSE_mm10/mouse_mm10.fa $r1 MAPPED/$base
+  done
+
+# This script runs bwa-mem and filters for quality of 30 (which excludes multi-mapping reads)
+# Results are placed in MAPPED
+# Example outputs are:
+#  reads.bam
+#  reads.q30.sort.bam
+#  reads.q30.sort.bam.bai
+#  reads.mapped_reads   # Read counts at each step and summary measures
+
+#############################################################################################################
+# 6) Create files of read density at each position in the geome.
+#    Reads are extended to the fragment length (150) and converted to 
+#    BigWig for viewing on UCSC genome browser or IGV
+
+# Make file of chromosome lengths
+get_chr_lens.sh MAPPED/DNA151222MG_1_131_K4_S6.bam > MM10_chrom_lens.txt
+
+# Make directory to hold density.gz files
+# These are in .bed format: chrom \t start \t end \t coverage
+# the coverage values are normalized by the total number of reads
+mkdir COVERAGE
+
+# Extend reads to the fragment length (150) and make density.gz files of the 
+# coverage of these fragments at each position
+# (normalized to total number of reads) and convert these to BigWig for 
+# viewing on IGV or other genome browser. Files are placed in COVERAGE
+for f in `ls MAPPED/DNA151222MG*.q30.sort.bam`
+  do ./make_BigWig.sh MM10_chrom_lens.txt $f 150
+  done
+
+################################################################################################################
+# 7) Calculate Pearson correlation coefficient for all pairs of samples
+
+# "Blacklisted" regions like repeats and telomeres need to be remove before 
+# computing correlations between samples. Site:
+# ENCODE Project Consortium. An integrated encyclopedia of DNA elements in the human genome. Nature. 2012 Sep 6;489(7414):57-74. doi: 10.1038/nature11247.
+
+# I downloaded the blacklisted regions from ENCODE at https://sites.google.com/site/anshulkundaje/projects/blacklists
+# Then converted them to mm10 using UCSC liftover tool.
+# I required that 10% of bases remap. 3033 regions were converted, 5 were not
+# they were all listed as "duplicated in new"
+# The lifted regions are in "mm10-blacklist_liftover.bed"
+
+# Remove blacklisted regions from the coverage files. 
+for f in `ls COVERAGE/*.density.gz`
+  do echo $f; out=${f/.q30.sort.density.gz/.filt.density.gz}
+  gunzip -c $f | bedtools intersect -v -a stdin -b mm10-blacklist_liftover.bed | gzip > $out
+  done   
+
+# blacklist.submit using remove_bl.sh
+
+# Get Pearson correlation for all pairs of filtered files
+# pseudocode from http://en.wikipedia.org/wiki/Talk:Correlation_and_dependence
+# Code from http://www.starklab.org/data/bardet_natprotoc_2011/correlation.awk
+
+touch H3K4me3_correlations.txt
+for f1 in `ls COVERAGE/*filt.density.gz`
+  do for f2 in `ls COVERAGE/*.filt.density.gz`
+    do n1=$(echo $f1 | cut -d'_' -f2)
+      n2=$(echo $f2 | cut -d'_' -f2)
+      if [ $n1 -lt $n2 ]
+        then nm1=${f1/.filt.density.gz/}; nm1=$(basename $nm1)
+          nm2=${f2/.filt.density.gz/}; nm2=$(basename $nm2)
+          echo -n $nm1 vs. $nm2 " :" >> correlations.txt
+          paste <(gunzip -c $f1) <(gunzip -c $f2) | \
+            awk '{if($2!=$6){exit 1};if($4!=0||$8!=0){print $4,$8}}' | \
+           ./correlation.awk >> correlations.txt
+      fi
+    done
+  done
+
+# Exacloud: get_corrs_filt.submit using get_cor_filt.sh
+# cat correlation_*K4*.txt > H3K4me3_correlations.txt
+
+# Shape correlations.txt into table with R
+Rscript reshape_corr.R H3K4me3_correlations.txt H3K4me3_cor_mat.tab
+
+##############################################################################################################
+# 8) Use SPP to call a loose set of peaks which will be paired down with the IDR analysis
+
+#Citation for run_SPP.R script: 
+# [1] Anshul Kundaje, Computer Science Dept., Stanford University, ENCODE Consortium, Personal Communication, Oct 2010 
+# [2] Kharchenko PK, Tolstorukov MY, Park PJ, Design and analysis of ChIP-seq experiments for DNA-binding proteins Nat Biotechnol. 2008 Dec;26(12):1351-9
+# Most of this pipeline follows a post at:
+# https://sites.google.com/site/anshulkundaje/projects/idr
+
+# Convert bam files to tagAlign format (extended bed)
+for f in `ls MAPPED/*q30.sort.bam`
+  do name=${f/.q30.sort.bam/}
+  samtools view -F 0x0204 -o - $f | \
+    awk 'BEGIN{OFS="\t"}{if (and($2,16) > 0) {print $3,($4-1),($4-1+length($10)) ,"N","1000","-"} \
+      else {print $3,($4-1),($4-1+length($10)),"N","1000","+"} }' | \
+    gzip -c > $name.tagAlign.gz
+  done
+
+# Now call peaks loosely for use in IDR analysis
+echo -e "Filename\tnumReads\testFragLen\tcorr_estFragLen\tPhantomPeak\tcorr_phantomPeak\targmin_corr\tmin_corr\tNormalized_SCC_(NSC)\tRelative_SCC_(RSC)\tQualityTag" > STATS/phantomPeakStatsReps.tab
+for f in `ls MAPPED/*K4*.tagAlign.gz`
+  do Rscript ../bin/phantompeakqualtools/run_spp_nodups.R \
+  -p=24
+  -c=$f \
+  -i=MAPPED/DNA151222MG_9_Input_S9.tagAlign.gz \
+  -npeak=300000 -odir=PEAKS -savr -savp -rf -out=STATS/phantomPeakStatsReps.tab
+
+# Get the  NSC and RSC for input sample. Code modified from phantompeakqualtools/run_spp_nodups.R
+Rscript get_NSC_RSC.R -p=24 -c=MAPPED/DNA151222MG_9_Input_S9.tagAlign.gz \
+  -odir=PEAKS -savd -savp -out=STATS/H3K4_phantomPeakStatsReps.tab
+
+# Exacloud: condor_submit HTC/call_peaks.submit
+
+###############################################################################################################
+# 9) Run self consistency analysis using pseudo replicates
+
+# First pool together all replicates from each condition 
+
+zcat MAPPED/DNA151222MG_1_131_K4_S6.tagAlign.gz \
+  MAPPED/DNA151222MG_3_151_K4_S7.tagAlign.gz \
+  MAPPED/DNA151222MG_5_171_K4_S5.tagAlign.gz \
+  MAPPED/DNA151222MG_7_211_K4_S3.tagAlign.gz | gzip -c > MAPPED/Alc_pool.tagAlign.gz
+
+zcat MAPPED/DNA151222MG_2_141_K4_S8.tagAlign.gz \
+  MAPPED/DNA151222MG_4_161_K4_S4.tagAlign.gz \
+  MAPPED/DNA151222MG_6_201_K4_S2.tagAlign.gz \
+  MAPPED/DNA151222MG_8_221_K4_S1.tagAlign.gz | gzip -c > MAPPED/Cont_pool.tagAlign.gz
+
+# Call peaks loosely on pooled samples 
+echo -e "Filename\tnumReads\testFragLen\tcorr_estFragLen\tPhantomPeak\tcorr_phantomPeak\targmin_corr\tmin_corr\tNormalized_SCC_(NSC)\tRelative_SCC_(RSC)/tQualityTag > STATS/phantomPeakStatsReps_pool.tab
+for f in `ls MAPPED/*pool*.tagAlign.gz`
+  do name=${f/.tagAlign.gz/}
+  Rscript ../bin/phantompeakqualtools/run_spp_nodups.R \
+    -p=24 \
+    -c=$f \
+    -i=MAPPED/DNA151222MG_9_Input_S9.tagAlign.gz \
+    -npeak=300000 -odir=PEAKS -savr -savp -rf -out=STATS/phantomPeakStatsReps_pool.tab &> $name.out
+  done
+
+# Split individual samples in to two pseudo-replicates
+outdir=PSEUDOREPS
+mkdir $outdir
+for f in `ls MAPPED/*K4*.tagAlign.gz`
+  do outStub=${f/.tagAlign.gz/_}
+  outStub=`basename $outStub`
+  nlines=$( zcat $f | wc -l )    # Number of reads in the tagAlign file
+  nlines=$(( (nlines + 1) / 2 )) # half that number
+  zcat $f | shuf | split -d -l $nlines - $outdir/$outStub # This will shuffle the lines in the file and split it into two parts
+  gzip "${outdir}/${outStub}00"
+  gzip "${outdir}/${outStub}01"
+  mv "${outdir}/${outStub}00.gz" "${outdir}/${outStub}.pr1.tagAlign.gz"
+  mv "${outdir}/${outStub}01.gz" "${outdir}/${outStub}.pr2.tagAlign.gz"
+  done
+
+# Call peaks loosely on the individual sample pseudo-replicates
+echo -e "Filename\tnumReads\testFragLen\tcorr_estFragLen\tPhantomPeak\tcorr_phantomPeak\targmin_corr\tmin_corr\tNormalized_SCC_(NSC)\tRelative_SCC_(RSC)/tQualityTag > STATS/phantomPeakStatsReps_PseudoReps.tab
+for f in `ls PSEUDOREPS/*.tagAlign.gz`
+  do name=${f/.tagAlign.gz/}
+  Rscript ../bin/phantompeakqualtools/run_spp_nodups.R \
+    -p=20 \
+    -c=$f \
+    -i=MAPPED/DNA151222MG_9_Input_S9.tagAlign.gz \
+    -npeak=300000 -odir=PSEUDOREPS -savr -savp -rf -out=STATS/phantomPeakStatsReps_PseudoReps.tab &> $name.out
+  done
+
+# Split the pooled data into pseudo-replicates
+outdir=PSEUDOREPS
+for f in `ls MAPPED/*pool.tagAlign.gz`
+  do outStub=${f/.tagAlign.gz/_}
+  outStub=`basename $outStub`
+  nlines=$( zcat $f | wc -l )
+  nlines=$(( (nlines + 1) / 2 ))
+  zcat $f | shuf | split -d -l $nlines - $outdir/$outStub
+  gzip "${outdir}/${outStub}00"
+  gzip "${outdir}/${outStub}01"
+  mv "${outdir}/${outStub}00.gz" "${outdir}/${outStub}.pr1.tagAlign.gz"
+  mv "${outdir}/${outStub}01.gz" "${outdir}/${outStub}.pr2.tagAlign.gz"
+  done
+
+# Call peaks loosely on pseudo-replicates of the pooled data
+for f in `ls PSEUDOREPS/Cont_pool*.tagAlign.gz`
+  do name=${f/.tagAlign.gz/}
+  Rscript ../bin/phantompeakqualtools/run_spp_nodups.R \
+    -p=24 \
+    -c=$f \
+    -i=MAPPED/DNA151222MG_9_Input_S9.tagAlign.gz \
+    -npeak=300000 -odir=PSEUDOREPS -savr -savp -rf -out=STATS/phantomPeakStatsReps_PseudoReps.tab &> $name.out
+  done
+
+###############################################################################################################
+# 10) Run IDR on all pairs of replicates and for pseudo replicates
+#     for each sample and for pooled samples.
+
+# Unzip regionPeak files
+gunzip PEAKS/*.regionPeak.gz
+
+# Copy file of chromosome lengths to "genome_table.txt"
+ln -s MOUSE_mm10/chrom_lens.txt genome_table.txt
+
+# Run consistency script of all pairs of peak files
+for file1 in `ls PEAKS/DNA*tagAlign.regionPeak`
+  do for file2 in `ls PEAKS/DNA*tagAlign.regionPeak`
+    do n1=$(echo $file1 | cut -d'_' -f2)
+      n2=$(echo $file2 | cut -d'_' -f2)
+      if [ $n1 -lt $n2 ]
+        then nm1=$(echo $file1 | cut -d'.' -f1); nm1=$(basename $nm1)
+          nm2=$(echo $file2 | cut -d'.' -f1); nm2=$(basename $nm2)
+          Rscript idrCode/batch-consistency-analysis.r $file1 $file2 \
+            -1 CONSISTENCY/${nm1}_VS_${nm2} 0 F signal.value
+      fi
+    done
+  done
+
+# Exacloud: idr_pairs.submit and idr_pairs2.submit run the wrapper run_idr.sh
+# in parallel
+
+# Make IDR plots for all pairs
+cd idrCode
+Rscript batch-consistency-plot.r 28 ../CONSISTENCY/All_IDR \
+  $(ls ../CONSISTENCY/DNA151222MG_*VS* | cut -d'-' -f1 | grep -v ".pr" | sort | uniq)
+
+# Make IDR plots for all pairs with the same condition
+cd idrCode
+Rscript batch-consistency-plot.r 6 \
+  ../CONSISTENCY/All_Alc_IDR \
+  ../CONSISTENCY/DNA151222MG_1_131_K4_S6_VS_DNA151222MG_3_151_K4_S7 \
+  ../CONSISTENCY/DNA151222MG_1_131_K4_S6_VS_DNA151222MG_5_171_K4_S5 \
+  ../CONSISTENCY/DNA151222MG_1_131_K4_S6_VS_DNA151222MG_7_211_K4_S3 \
+  ../CONSISTENCY/DNA151222MG_3_151_K4_S7_VS_DNA151222MG_5_171_K4_S5 \
+  ../CONSISTENCY/DNA151222MG_3_151_K4_S7_VS_DNA151222MG_7_211_K4_S3 \
+  ../CONSISTENCY/DNA151222MG_5_171_K4_S5_VS_DNA151222MG_7_211_K4_S3
+
+Rscript batch-consistency-plot.r 6 \
+  ../CONSISTENCY/All_Cont_IDR \
+  ../CONSISTENCY/DNA151222MG_2_141_K4_S8_VS_DNA151222MG_4_161_K4_S4 \
+  ../CONSISTENCY/DNA151222MG_2_141_K4_S8_VS_DNA151222MG_6_201_K4_S2 \
+  ../CONSISTENCY/DNA151222MG_2_141_K4_S8_VS_DNA151222MG_8_221_K4_S1 \
+  ../CONSISTENCY/DNA151222MG_4_161_K4_S4_VS_DNA151222MG_6_201_K4_S2 \
+  ../CONSISTENCY/DNA151222MG_4_161_K4_S4_VS_DNA151222MG_8_221_K4_S1 \
+  ../CONSISTENCY/DNA151222MG_6_201_K4_S2_VS_DNA151222MG_8_221_K4_S1
+cd ..
+
+# Run IDR on pseudo-replicates
+for f1 in `ls PSEUDOREPS/*.pr1*.tagAlign.regionPeak`
+  do f2=${f1/.pr1./.pr2.}
+  nm1=${f1/.pr1.*/.pr1}; nm1=$(basename $nm1)
+  nm2=${f2/.pr2.*/.pr2}; nm2=$(basename $nm2)
+  Rscript idrCode/batch-consistency-analysis.r $f1 $f2 \
+    -1 CONSISTENCY/${nm1}_VS_${nm2} 0 F signal.value
+  done
+
+# Make IDR plots for pseudo replicates
+cd idrCode
+Rscript batch-consistency-plot.r 8 \
+  ../CONSISTENCY/All_Pseudo_IDR \
+  $(ls ../CONSISTENCY/DNA*pr* | cut -d'-' -f1 | sort | uniq)
+cd ..
+
+# Run IDR on pooled pseudo-replicates
+Rscript idrCode/batch-consistency-analysis.r \
+  PSEUDOREPS/Alc_pool_.pr1.tagAlign_VS_DNA151222MG_9_Input_S9.tagAlign.regionPeak \
+  PSEUDOREPS/Alc_pool_.pr2.tagAlign_VS_DNA151222MG_9_Input_S9.tagAlign.regionPeak \
+  -1 CONSISTENCY/Alc_pool_.pr1_VS_Alc_pool_.pr2 0 F signal.value
+
+Rscript idrCode/batch-consistency-analysis.r \
+  PSEUDOREPS/Cont_pool_.pr1.tagAlign_VS_DNA151222MG_9_Input_S9.tagAlign.regionPeak \
+  PSEUDOREPS/Cont_pool_.pr2.tagAlign_VS_DNA151222MG_9_Input_S9.tagAlign.regionPeak \
+  -1 CONSISTENCY/Cont_pool_.pr1_VS_Cont_pool_.pr2 0 F signal.value
+
+# Make IDR plots for pooled pseudo replicates
+cd idrCode
+Rscript batch-consistency-plot.r 2 \
+  ../CONSISTENCY/All_Pooled_Pseudo_IDR \
+  ../CONSISTENCY/Alc_pool_.pr1_VS_Alc_pool_.pr2 \
+  ../CONSISTENCY/Cont_pool_.pr1_VS_Cont_pool_.pr2
+cd ..
+
+# TODO: Make plots with all alcohol and control pairs on the same plot
+# colored by treatment.
+
+# Get the number of peaks at an IDR of 0.01 for each pair of samples
+# this is used to truncate peak lists
+touch IDR_peak_counts.txt
+for f in $(ls CONSISTENCY/DNA*overlapped-peaks.txt)
+  do echo -n "${f/-overlapped-peaks.txt/}: " >> IDR_peak_counts.txt
+  awk '$11 <= 0.01 {print $0}' $f | wc -l >> IDR_peak_counts.txt
+  done
+
+# Get the number of consistent peaks in pooled pseudo-replicates (note that the cut-off is lower
+# here, the website mentioned above where this workflow originates gives the reasoning: 
+# "The equivalence between a pooled-consistency threshold of 0.0025 and original replicate 
+#  consistency threshold of 0.01 was calibrated based on a gold-standard pair of high quality 
+#  replicate datasets for the CTCF transcription factor in human." 
+
+echo -n "CONSISTENCY/Alc_pool_.pr1_VS_Alc_pool_.pr2:" >> IDR_peak_counts.txt
+awk '$11 <= 0.0025 {print $0}' CONSISTENCY/Alc_pool_.pr1_VS_Alc_pool_.pr2-overlapped-peaks.txt | \
+  wc -l >> IDR_peak_counts.txt
+echo -n "CONSISTENCY/Cont_pool_.pr1_VS_Cont_pool_.pr2:" >> IDR_peak_counts.txt
+awk '$11 <= 0.0025 {print $0}' CONSISTENCY/Cont_pool_.pr1_VS_Cont_pool_.pr2-overlapped-peaks.txt | \
+  wc -l >> IDR_peak_counts.txt
+
+# For each sample find the maximum number of peaks that it shares with any other sample and 
+# create a .bed file with only this many peaks.
+for f in `ls PEAKS/*.regionPeak`; do
+  samp=$(echo $f | cut -d'.' -f1); samp=${samp/PEAKS\//}
+  max=$(grep $samp IDR_peak_counts.txt | grep -v "pr1" | \
+    awk 'BEGIN{max=0}{if(($2)>max)  max=($2)}END {print max}')
+  cat $f | sort -k7nr,7nr | head -n $max | awk 'OFS="\t" {print $1,$2,$3,$7}' | \
+    gzip -c > USED_H3K4_PEAKS/$samp.bed.gz
+done
+
+# We decided to remove samples 1&2 from the analysis since they have a high number of duplicate
+# reads. The only effect this has (so far) is to reduce the number of peaks in sample 5 from 
+# 17,589 to 17,336. This is because sample 5 shared the most peaks with sample 1.
+zcat USED_H3K4_PEAKS/DNA151222MG_5_171_K4_S5.bed.gz | head -n 17336 \
+  | gzip > USED_H3K4_PEAKS/DNA151222MG_5_171_K4_S5_2.bed.gz
+
+# Set the max_numPeaks_Alc & max_numPeaks_Con to the maximum number of peaks 
+# found in comparisons between samples. Note that these numbers are larger than the number
+# of peaks found in the pseudo-replicate IDR analysis of pooled samples.
+# We use these numbers of peaks from the pooled replicates for our comparison between conditions.
+
+max_numPeaks_Alc=17589
+max_numPeaks_Con=14475
+
+# Get a set of peaks for both conditions from the pooled samples.
+cat PEAKS/Alc_pool.tagAlign_VS_DNA151222MG_9_Input_S9.tagAlign.regionPeak | \
+  sort -k7nr,7nr | head -n $max_numPeaks_Alc | \
+  gzip -c > Alc_pool.conservative_VS_DNA151222MG_9_Input_S9.regionPeak.gz
+
+cat PEAKS/Cont_pool.tagAlign_VS_DNA151222MG_9_Input_S9.tagAlign.regionPeak | \
+  sort -k7nr,7nr | head -n $max_numPeaks_Con | \
+  gzip -c > Con_pool.conservative_VS_DNA151222MG_9_Input_S9.regionPeak.gz
+
+mkdir USED_H3K4_PEAKS
+mv *.regionPeak.gz USED_H3K4_PEAKS/
+
+# Convert these to bed files for viewing
+zcat USED_H3K4_PEAKS/Alc_pool.conservative_VS_DNA151222MG_9_Input_S9.regionPeak.gz | \
+  awk 'OFS="\t" {print $1,$2,$3,".",$7}' > USED_H3K4_PEAKS/Alc_pool_peaks.bed
+zcat USED_H3K4_PEAKS/Con_pool.conservative_VS_DNA151222MG_9_Input_S9.regionPeak.gz | \
+  awk 'OFS="\t" {print $1,$2,$3,".",$7}' > USED_H3K4_PEAKS/Con_pool_peaks.bed
+
+#################################################################################
+# 11) Run DiffBind to find differentially bound peaks between alcohol and
+#     control samples
+
+mkdir H3K4_analysis
+mkdir H3K4_analysis_MINUS12
+# Write H3K4_analysis/H3K4me3_samples.csv and 
+# H3K4_analysis_MINUS12/H3K4me3_samples_minus12.csv by hand. 
+# These have:
+# Sample id, Tissue, Factor = alcohol or control, 
+# Treatment (blank), Replicate, bamReads = bam read file, 
+# ControlID (input sample id), bamControl = input bam file,
+# Peaks = bed file of called peaks
+
+# Run R script for all samples, 150 is the fragment length
+Rscript run_DiffBind_H3K4.R H3K4_analysis/H3K4me3_samples.csv \
+  150 H3K4_analysis/ &> H3K4_analysis/all_out.txt
+Rscript run_DiffBind_H3K4_minus12.R H3K4_analysis_MINUS12/H3K4me3_samples_minus12.csv \
+  150 H3K4_analysis_MINUS12/ &> H3K4_analysis_MINUS12/all_out.txt
+
+# This performs:
+# Occupancy analysis looking at differences in which peaks were called
+#   between samples and conditions
+# Differential binding analysis looking at differences in normalized 
+#   read counts in peak regions across samples and conditions.
+#   There are 3 options for the differential binding statistics
+#   - EdgeR
+#   - DESeq
+#   - DESeq2
+
+# Run R script excluding samples 5 & 6
+# Rscript run_DiffBind.R H3K4me3_minus56_samples.csv 150 MINUS56_H3K4_analysis/ &> \
+#   minus56_out.txt
+
+
+# TODO:Use R to generate histograms of the sizes of the peaks and their chromsomal 
+# distribution
+
+#######################################################################################################
+# 11) Find overlapping and differing peaks between conditions.
+
+# First get a list of peaks called in either of the two pooled samples and look at the overlap. 
+# Define regions with a confident peak in any sample as the region around the peak summit
+# with the fragment size (150) 
+
+SIZE=75 # Half of genomic fragment length
+for pair in chip_dmel-input_dmel chip_dyak_dm3-input_dyak_dm3; do
+  awk -vOFS='\t' -vSIZE=$SIZE '{s=$2+$4-SIZE;e=$2+$4+SIZE;print $1,s,e}'
+  ${pair}_macs_confident.txt
+  done | sort -k1,1 -k2,2n | mergeBed -i stdin > peak_regions.txt
+
+
+# For each sample and each region add the ratio of chip_read_density / input_read_density
