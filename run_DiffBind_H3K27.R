@@ -26,7 +26,7 @@ library(dplyr)
 library(DiffBind)
 library(GenomicFeatures)
 library(AnnotationDbi)
-library(org.Mm.eg.db)
+# library(org.Mm.eg.db)
 
 args <- commandArgs(TRUE)
 all.samples.csv <- args[1]
@@ -35,6 +35,8 @@ pseudo.samples.csv <- args[3]
 ps.pool.samples.csv <- args[4]
 frag.size <- args[5]
 out.dir <- args[6]
+gene_file <- 'mm10_refseq.bed'
+
 # all.samples.csv <- 'H3K27me3_samples.csv'
 # pool.samples.csv <- 'H3K27me3_pool_samples.csv'
 # pseudo.samples.csv <- 'H3K27me3_pseudo_samples.csv'
@@ -294,12 +296,17 @@ all.con.list[['all.peaks']] <- all.con$inAll
 
 # Find genes overlapping these peak sets.
 #########################################
-
 # Download genes and make GRanges object
-genes.txdb <- makeTxDbFromUCSC(genome="mm10", tablename="refGene")
-genes.gr <- genes(genes.txdb)
-genes.gr$symbol <- mapIds(org.Mm.eg.db, keys=genes.gr$gene_id,
-                          column='SYMBOL', keytype='ENTREZID', multiVals='first')
+# genes.txdb <- makeTxDbFromUCSC(genome="mm10", tablename="refGene")
+# genes.gr <- genes(genes.txdb)
+# genes.gr$symbol <- mapIds(org.Mm.eg.db, keys=genes.gr$gene_id,
+#                          column='SYMBOL', keytype='ENTREZID', multiVals='first')
+
+genes <- read.table(gene_file)
+genes.gr <- makeGRangesFromDataFrame(genes, keep.extra.columns=T,
+  seqnames.field='V1', start.field='V2', end.field='V3')
+mcols(genes.gr)[[1]] <- as.vector(mcols(genes.gr)[[1]])
+names(mcols(genes.gr))[1] <- 'gene_id'
 
 alc.peaks.lap.genes.list <- lapply(all.alc.list, subsetByOverlaps, genes.gr)
 con.peaks.lap.genes.list <- lapply(all.con.list, subsetByOverlaps, genes.gr)
@@ -315,31 +322,31 @@ get_lap_ids <- function(query, subject) {
   return(id.df$ids)
 }
 
-# Function to get gene symbols for overlaps
-get_symbols <- function(query, subject) {
-  laps <- findOverlaps(query, subject)
-  lap.df <- tbl_df(data.frame(q_idx=laps@queryHits, 
-                              s_idx=laps@subjectHits,
-                              sym=subject$symbol[laps@subjectHits]))
-  symbol.df <- group_by(lap.df, q_idx) %>%
-    summarise(symbols=paste(sym, sep=',', collapse=','))
-  return(symbol.df$symbols)
-}
+# # Function to get gene symbols for overlaps
+# get_symbols <- function(query, subject) {
+#   laps <- findOverlaps(query, subject)
+#   lap.df <- tbl_df(data.frame(q_idx=laps@queryHits, 
+#                               s_idx=laps@subjectHits,
+#                               sym=subject$symbol[laps@subjectHits]))
+#   symbol.df <- group_by(lap.df, q_idx) %>%
+#     summarise(symbols=paste(sym, sep=',', collapse=','))
+#   return(symbol.df$symbols)
+# }
 
 # Add gene ids & symbols to these GRanges as metadata
 
 for(i in 1:length(alc.peaks.lap.genes.list)) {
   alc.peaks.lap.genes.list[[i]]$gene_ids <- 
     get_lap_ids(all.alc.list[[i]], genes.gr)
-  alc.peaks.lap.genes.list[[i]]$gene.symbol <- 
-    get_symbols(all.alc.list[[i]], genes.gr)
+#  alc.peaks.lap.genes.list[[i]]$gene.symbol <- 
+#    get_symbols(all.alc.list[[i]], genes.gr)
 }
 
 for(i in 1:length(con.peaks.lap.genes.list)) {
   con.peaks.lap.genes.list[[i]]$gene_ids <- 
     get_lap_ids(all.con.list[[i]], genes.gr)
-  con.peaks.lap.genes.list[[i]]$gene.symbol <- 
-    get_symbols(all.con.list[[i]], genes.gr)
+#  con.peaks.lap.genes.list[[i]]$gene.symbol <- 
+#    get_symbols(all.con.list[[i]], genes.gr)
 }
 
 alc.genes.lap.peaks.list <- 
@@ -354,8 +361,7 @@ alc.genes.lap.peaks.list <- tmp
 tmp <- sapply(con.genes.lap.peaks.list, sort)
 con.genes.lap.peaks.list <- tmp
 
-# Find genes that have peaks mostly unique to alcohol and peaks completely 
-# unique to contols
+# Find genes that have peaks unique to alcohol and peaks unique to contols
 alc.and.con.list <- intersect(c(alc.genes.lap.peaks.list[['con.0']]$gene_id,
                                 alc.genes.lap.peaks.list[['con.1']]$gene_id,
                                 alc.genes.lap.peaks.list[['con.2']]$gene_id,
@@ -411,7 +417,6 @@ con.peaks.df <- rbind(con.peaks.df,
              end=end(all.con.list[['alc.3']]),
              lap.alc=3))
 
-
 # Make a data frame of genes with peaks in all 4 alcohol samples
 # sorted by the number of control samples that also have these peaks
 # and with a column to indicate whether the gene also has a peak that
@@ -421,28 +426,28 @@ alc.genes.df <- data.frame(chr=seqnames(alc.genes.lap.peaks.list[['con.0']]),
                            start=start(alc.genes.lap.peaks.list[['con.0']]),
                            end=end(alc.genes.lap.peaks.list[['con.0']]),
                            gene_id=alc.genes.lap.peaks.list[['con.0']]$gene_id,
-                           symbol=alc.genes.lap.peaks.list[['con.0']]$symbol,
+#                           symbol=alc.genes.lap.peaks.list[['con.0']]$symbol,
                            lap.con=0)
 alc.genes.df <- rbind(alc.genes.df,
   data.frame(chr=seqnames(alc.genes.lap.peaks.list[['con.1']]),
              start=start(alc.genes.lap.peaks.list[['con.1']]),
              end=end(alc.genes.lap.peaks.list[['con.1']]),
              gene_id=alc.genes.lap.peaks.list[['con.1']]$gene_id,
-             symbol=alc.genes.lap.peaks.list[['con.1']]$symbol,
+#             symbol=alc.genes.lap.peaks.list[['con.1']]$symbol,
              lap.con=1))
 alc.genes.df <- rbind(alc.genes.df,
   data.frame(chr=seqnames(alc.genes.lap.peaks.list[['con.2']]),
              start=start(alc.genes.lap.peaks.list[['con.2']]),
              end=end(alc.genes.lap.peaks.list[['con.2']]),
              gene_id=alc.genes.lap.peaks.list[['con.2']]$gene_id,
-             symbol=alc.genes.lap.peaks.list[['con.2']]$symbol,
+#             symbol=alc.genes.lap.peaks.list[['con.2']]$symbol,
              lap.con=2))
 alc.genes.df <- rbind(alc.genes.df,
   data.frame(chr=seqnames(alc.genes.lap.peaks.list[['con.3']]),
              start=start(alc.genes.lap.peaks.list[['con.3']]),
              end=end(alc.genes.lap.peaks.list[['con.3']]),
              gene_id=alc.genes.lap.peaks.list[['con.3']]$gene_id,
-             symbol=alc.genes.lap.peaks.list[['con.3']]$symbol,
+#             symbol=alc.genes.lap.peaks.list[['con.3']]$symbol,
              lap.con=3))
 
 # Add a column indicating whether the gene also has peaks that are unique 
@@ -459,28 +464,28 @@ con.genes.df <- data.frame(chr=seqnames(con.genes.lap.peaks.list[['alc.0']]),
                            start=start(con.genes.lap.peaks.list[['alc.0']]),
                            end=end(con.genes.lap.peaks.list[['alc.0']]),
                            gene_id=con.genes.lap.peaks.list[['alc.0']]$gene_id,
-                           symbol=con.genes.lap.peaks.list[['alc.0']]$symbol,
+#                           symbol=con.genes.lap.peaks.list[['alc.0']]$symbol,
                            lap.alc=0)
 con.genes.df <- rbind(con.genes.df,
   data.frame(chr=seqnames(con.genes.lap.peaks.list[['alc.1']]),
              start=start(con.genes.lap.peaks.list[['alc.1']]),
              end=end(con.genes.lap.peaks.list[['alc.1']]),
              gene_id=con.genes.lap.peaks.list[['alc.1']]$gene_id,
-             symbol=con.genes.lap.peaks.list[['alc.1']]$symbol,
+#             symbol=con.genes.lap.peaks.list[['alc.1']]$symbol,
              lap.alc=1))
 con.genes.df <- rbind(con.genes.df,
   data.frame(chr=seqnames(con.genes.lap.peaks.list[['alc.2']]),
              start=start(con.genes.lap.peaks.list[['alc.2']]),
              end=end(con.genes.lap.peaks.list[['alc.2']]),
              gene_id=con.genes.lap.peaks.list[['alc.2']]$gene_id,
-             symbol=con.genes.lap.peaks.list[['alc.2']]$symbol,
+#             symbol=con.genes.lap.peaks.list[['alc.2']]$symbol,
              lap.alc=2))
 con.genes.df <- rbind(con.genes.df,
   data.frame(chr=seqnames(con.genes.lap.peaks.list[['alc.3']]),
              start=start(con.genes.lap.peaks.list[['alc.3']]),
              end=end(con.genes.lap.peaks.list[['alc.3']]),
              gene_id=con.genes.lap.peaks.list[['alc.3']]$gene_id,
-             symbol=con.genes.lap.peaks.list[['alc.3']]$symbol,
+#             symbol=con.genes.lap.peaks.list[['alc.3']]$symbol,
              lap.alc=3))
 
 # Add a column indicating whether the gene also has peaks that are unique 
